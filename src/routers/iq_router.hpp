@@ -178,6 +178,9 @@ public:
   SwitchMonitor const * const GetSwitchMonitor() const {return _switchMonitor;}
   BufferMonitor const * const GetBufferMonitor() const {return _bufferMonitor;}
 
+  Buffer      * GetInputBuffer      (int port) { return _buf[port]; }
+  BufferState * GetOutputBufferState(int port) { return _next_buf[port]; }
+
 };
 
 #endif

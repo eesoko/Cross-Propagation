@@ -36,9 +36,10 @@
 #include "booksim_config.hpp"
 #include "trafficmanager.hpp"
 #include "batchtrafficmanager.hpp"
-#include "random_utils.hpp" 
+#include "random_utils.hpp"
 #include "vc.hpp"
 #include "packet_reply_info.hpp"
+#include "mesh.hpp"
 
 TrafficManager * TrafficManager::New(Configuration const & config,
                                      vector<Network *> const & net)
@@ -232,27 +233,35 @@ TrafficManager::TrafficManager( const Configuration &config, const vector<Networ
         _injection_process[c] = InjectionProcess::New(injection_process[c], _nodes, _load[c], &config);
     }
 
-    // ============ Injection VC states  ============ 
+    // ============ Injection VC states  ============
 
     _buf_states.resize(_nodes);
     _last_vc.resize(_nodes);
     _last_class.resize(_nodes);
 
+    const Mesh * mesh_init = dynamic_cast<const Mesh *>(_net[0]);
+
     for ( int source = 0; source < _nodes; ++source ) {
-        _buf_states[source].resize(_subnets);
-        _last_class[source].resize(_subnets, 0);
-        _last_vc[source].resize(_subnets);
-        for ( int subnet = 0; subnet < _subnets; ++subnet ) {
-            ostringstream tmp_name;
-            tmp_name << "terminal_buf_state_" << source << "_" << subnet;
-            BufferState * bs = new BufferState( config, this, tmp_name.str( ) );
-            int vc_alloc_delay = config.GetInt("vc_alloc_delay");
-            int sw_alloc_delay = config.GetInt("sw_alloc_delay");
-            int router_latency = config.GetInt("routing_delay") + (config.GetInt("speculative") ? max(vc_alloc_delay, sw_alloc_delay) : (vc_alloc_delay + sw_alloc_delay));
-            int min_latency = 1 + _net[subnet]->GetInject(source)->GetLatency() + router_latency + _net[subnet]->GetInjectCred(source)->GetLatency();
-            bs->SetMinLatency(min_latency);
-            _buf_states[source][subnet] = bs;
-            _last_vc[source][subnet].resize(_classes, -1);
+        int ni = mesh_init ? mesh_init->NumInjectionSlots(source) : 1;
+        _buf_states[source].resize(ni);
+        _last_class[source].resize(ni);
+        _last_vc[source].resize(ni);
+        for ( int slot = 0; slot < ni; ++slot ) {
+            _buf_states[source][slot].resize(_subnets);
+            _last_class[source][slot].resize(_subnets, 0);
+            _last_vc[source][slot].resize(_subnets);
+            for ( int subnet = 0; subnet < _subnets; ++subnet ) {
+                ostringstream tmp_name;
+                tmp_name << "terminal_buf_state_" << source << "_" << slot << "_" << subnet;
+                BufferState * bs = new BufferState( config, this, tmp_name.str( ) );
+                int vc_alloc_delay = config.GetInt("vc_alloc_delay");
+                int sw_alloc_delay = config.GetInt("sw_alloc_delay");
+                int router_latency = config.GetInt("routing_delay") + (config.GetInt("speculative") ? max(vc_alloc_delay, sw_alloc_delay) : (vc_alloc_delay + sw_alloc_delay));
+                int min_latency = 1 + _net[subnet]->GetInject(source)->GetLatency() + router_latency + _net[subnet]->GetInjectCred(source)->GetLatency();
+                bs->SetMinLatency(min_latency);
+                _buf_states[source][slot][subnet] = bs;
+                _last_vc[source][slot][subnet].resize(_classes, -1);
+            }
         }
     }
 
@@ -276,7 +285,11 @@ TrafficManager::TrafficManager( const Configuration &config, const vector<Networ
     for ( int s = 0; s < _nodes; ++s ) {
         _qtime[s].resize(_classes);
         _qdrained[s].resize(_classes);
-        _partial_packets[s].resize(_classes);
+        int ni = mesh_init ? mesh_init->NumInjectionSlots(s) : 1;
+        _partial_packets[s].resize(ni);
+        for ( int slot = 0; slot < ni; ++slot ) {
+            _partial_packets[s][slot].resize(_classes);
+        }
     }
 
     _total_in_flight_flits.resize(_classes);
@@ -582,7 +595,29 @@ TrafficManager::TrafficManager( const Configuration &config, const vector<Networ
     _slowest_flit.resize(_classes, -1);
     _slowest_packet.resize(_classes, -1);
 
- 
+    // ============ Cross-Propagation All-Reduce init ============
+    _cp_enabled = false;
+    for(int c = 0; c < _classes; ++c) {
+        if(_traffic[c] == "cross_propagation") {
+            _cp_enabled = true;
+            break;
+        }
+    }
+    _cp_phase1_injected    = false;
+    _cp_k                  = gK;
+    _cp_center             = (_cp_k / 2) * _cp_k + (_cp_k / 2);
+    _cp_phase              = 0;
+    _cp_center_recv        = 0;
+    _cp_outer_recv         = 0;
+    _cp_phase1_start_cycle = -1;
+    _cp_phase1_end_cycle   = -1;
+    _cp_phase2_end_cycle   = -1;
+    _cp_total_flits        = 0;
+    for ( int i = 0; i < 8; ++i ) {
+        _cp_cross_recv[i]   = 0;
+        _cp_cross_sent[i]   = false;
+        _cp_cross_p2_recv[i] = false;
+    }
 
 }
 
@@ -590,8 +625,10 @@ TrafficManager::~TrafficManager( )
 {
 
     for ( int source = 0; source < _nodes; ++source ) {
-        for ( int subnet = 0; subnet < _subnets; ++subnet ) {
-            delete _buf_states[source][subnet];
+        for ( int slot = 0; slot < (int)_buf_states[source].size(); ++slot ) {
+            for ( int subnet = 0; subnet < _subnets; ++subnet ) {
+                delete _buf_states[source][slot][subnet];
+            }
         }
     }
   
@@ -749,6 +786,101 @@ void TrafficManager::_RetireFlit( Flit *f, int dest )
     } else {
         f->Free();
     }
+
+    // ----------------------------------------------------------------
+    // Cross-Propagation All-Reduce: hierarchical 4-phase barrier
+    // ----------------------------------------------------------------
+    // All barrier logic fires on tail flits only (one event per packet).
+    if ( _cp_enabled && f->tail ) {
+
+        if ( _cp_phase == 0 ) {
+
+            // --------------------------------------------------
+            // Phase 1: outer → cross  (local barrier per cross node)
+            // --------------------------------------------------
+            if ( gMeshNet->IsCrossNode(dest) && !gMeshNet->IsCenterNode(dest) ) {
+                const int idx = _CpCrossIndex(dest);
+                ++_cp_cross_recv[idx];
+
+                if ( _cp_cross_recv[idx] == 4 && !_cp_cross_sent[idx] ) {
+                    _cp_cross_sent[idx] = true;
+                    cout << "[CP] Phase1 local barrier fired: cross=" << dest
+                         << " cycle=" << _time << endl;
+                    _InjectCrossToCenter(dest);
+                }
+            }
+
+            // --------------------------------------------------
+            // Phase 2: cross → center  (global barrier at center)
+            // --------------------------------------------------
+            if ( dest == _cp_center ) {
+                ++_cp_center_recv;
+
+                if ( _cp_center_recv == 8 ) {
+                    _cp_phase1_end_cycle = _time;
+                    cout << "[CP] Phase2 global barrier fired: reduce done"
+                         << "  cycle=" << _cp_phase1_end_cycle
+                         << "  reduce_latency="
+                         << (_cp_phase1_end_cycle - _cp_phase1_start_cycle)
+                         << " cycles" << endl;
+                    _cp_phase = 1;
+                    _InjectCenterToCross();
+                }
+            }
+
+        } else if ( _cp_phase == 1 ) {
+
+            // --------------------------------------------------
+            // Phase 3: center → cross  (per-cross sub-barrier)
+            // --------------------------------------------------
+            if ( gMeshNet->IsCrossNode(dest) && !gMeshNet->IsCenterNode(dest)
+                 && f->src == _cp_center ) {
+                const int idx = _CpCrossIndex(dest);
+                _cp_cross_p2_recv[idx] = true;
+
+                if ( _CpIsColCross(dest) ) {
+                    _InjectColCrossToOuter(dest);   // Phase 4a: D/2 Px horizontal
+                } else {
+                    _InjectRowCrossToOuter(dest);   // Phase 4b: D/2 Py vertical
+                }
+            }
+
+            // --------------------------------------------------
+            // Phase 4: cross → outer  (end barrier: 16 Px + 16 Py = 32 total)
+            // --------------------------------------------------
+            if ( !gMeshNet->IsCrossNode(dest) ) {
+                ++_cp_outer_recv;
+
+                if ( _cp_outer_recv == 32 ) {
+                    _cp_phase2_end_cycle = _time;
+                    _cp_phase = 2;
+
+                    const int reduce_lat    = _cp_phase1_end_cycle - _cp_phase1_start_cycle;
+                    const int broadcast_lat = _cp_phase2_end_cycle - _cp_phase1_end_cycle;
+                    const int total_lat     = _cp_phase2_end_cycle - _cp_phase1_start_cycle;
+                    const int pkt_size      = _GetNextPacketSize(0);
+
+                    cout << "\n====== Cross-Propagation All-Reduce Summary ======\n"
+                         << "  Mesh size   : " << _cp_k << "x" << _cp_k
+                         << " (" << _nodes << " nodes)\n"
+                         << "  Packet size : D=" << pkt_size
+                         << " flits  (Px/Py=" << pkt_size/2 << " flits)\n"
+                         << "  ---- Timing ----\n"
+                         << "  Reduce    (Phase 1+2): " << reduce_lat
+                         << " cycles  [outer→cross→center]\n"
+                         << "  Broadcast (Phase 3+4): " << broadcast_lat
+                         << " cycles  [center→cross→outer]\n"
+                         << "  Total All-Reduce     : " << total_lat
+                         << " cycles\n"
+                         << "  ---- Traffic ----\n"
+                         << "  Total flits injected : " << _cp_total_flits
+                         << " flits\n"
+                         << "==================================================\n"
+                         << endl;
+                }
+            }
+        }
+    }
 }
 
 int TrafficManager::_IssuePacket( int source, int cl )
@@ -788,7 +920,7 @@ void TrafficManager::_GeneratePacket( int source, int stype,
     assert(stype!=0);
 
     Flit::FlitType packet_type = Flit::ANY_TYPE;
-    int size = _GetNextPacketSize(cl); //input size 
+    int size = _GetNextPacketSize(cl); //input size
     int pid = _cur_pid++;
     assert(_cur_pid);
     int packet_destination = _traffic_pattern[cl]->dest(source);
@@ -915,17 +1047,239 @@ void TrafficManager::_GeneratePacket( int source, int stype,
                        << "." << endl;
         }
 
-        _partial_packets[source][cl].push_back( f );
+        _partial_packets[source][0][cl].push_back( f );
     }
 }
 
+// ============================================================
+// Cross-Propagation All-Reduce — Node classification helpers
+// ============================================================
+
+// col-cross: on center column (col == k/2), but NOT center row (row != k/2)
+bool TrafficManager::_CpIsColCross( int node ) const {
+    return (node % _cp_k == _cp_k / 2) && (node / _cp_k != _cp_k / 2);
+}
+
+// row-cross: on center row (row == k/2), but NOT center column (col != k/2)
+bool TrafficManager::_CpIsRowCross( int node ) const {
+    return (node / _cp_k == _cp_k / 2) && (node % _cp_k != _cp_k / 2);
+}
+
+// Returns 0-7 index for a cross (non-center) node.
+// col-cross rows {0,1,3,4} → indices {0,1,2,3}  (skipping center row)
+// row-cross cols {0,1,3,4} → indices {4,5,6,7}  (skipping center col)
+int TrafficManager::_CpCrossIndex( int node ) const {
+    const int half = _cp_k / 2;
+    if ( _CpIsColCross(node) ) {
+        int row = node / _cp_k;
+        return (row < half) ? row : row - 1;   // 0,1,3,4 → 0,1,2,3
+    } else {
+        int col = node % _cp_k;
+        return 4 + ((col < half) ? col : col - 1);  // 0,1,3,4 → 4,5,6,7
+    }
+}
+
+// col-cross node ID for a given row  (= row * k + k/2)
+int TrafficManager::_CpColCrossForRow( int row ) const {
+    return row * _cp_k + _cp_k / 2;
+}
+
+// row-cross node ID for a given col  (= (k/2)*k + col)
+int TrafficManager::_CpRowCrossForCol( int col ) const {
+    return (_cp_k / 2) * _cp_k + col;
+}
+
+// ============================================================
+// Cross-Propagation All-Reduce — Common packet injector
+// ============================================================
+
+// Enqueue one packet (src→dest, size flits) into src's partial_packets queue.
+// slot selection:
+//   is_px=true  → slot 0  (XY routing)
+//   is_px=false → slot 1  (YX routing, outer nodes only)
+//   center node → slot chosen by dest direction (N/S/E/W)
+void TrafficManager::_CpInjectPacket( int src, int dest, int size, int cl, bool is_px )
+{
+    assert(size > 0);
+    const int pid        = _cur_pid++;
+    assert(_cur_pid);
+    const int subnetwork = (_subnets == 1) ? 0 : RandomInt(_subnets - 1);
+
+    // Slot selection
+    int slot;
+    if ( src == _cp_center ) {
+        // Center node uses directional slots (N=0, S=1, E=2, W=3)
+        const int half = _cp_k / 2;
+        const int dr   = dest / _cp_k;
+        const int dc   = dest % _cp_k;
+        if      ( dr < half ) slot = 0;
+        else if ( dr > half ) slot = 1;
+        else if ( dc > half ) slot = 2;
+        else                  slot = 3;
+    } else if ( gMeshNet->IsCrossNode(src) ) {
+        // Cross nodes (non-center) always use slot 0 (single NI slot)
+        slot = 0;
+    } else {
+        // Outer nodes: Px → slot 0 (XY), Py → slot 1 (YX)
+        slot = is_px ? 0 : 1;
+    }
+
+    for ( int i = 0; i < size; ++i ) {
+        Flit *f       = Flit::New();
+        f->id         = _cur_id++;
+        assert(_cur_id);
+        f->pid        = pid;
+        f->watch      = gWatchOut && (_packets_to_watch.count(pid) > 0);
+        f->subnetwork = subnetwork;
+        f->src        = src;
+        f->ctime      = _time;
+        f->record     = false;
+        f->cl         = cl;
+        f->type       = Flit::ANY_TYPE;
+        f->is_px      = is_px;
+
+        _total_in_flight_flits[cl].insert(make_pair(f->id, f));
+
+        f->head = (i == 0);
+        f->dest = (i == 0) ? dest : -1;
+        f->pri  = 0;
+        f->tail = (i == size - 1);
+        f->vc   = -1;
+
+        _partial_packets[src][slot][cl].push_back(f);
+    }
+
+    _requestsOutstanding[src]++;
+    _cp_total_flits += size;
+}
+
+// ============================================================
+// Cross-Propagation All-Reduce — Phase 0: Outer → Cross
+// ============================================================
+
+// One-shot: outer nodes inject Px → col-cross, Py → row-cross (both D/2 flits).
+// Cross nodes and center node do NOT inject here; they wait for incoming packets.
+void TrafficManager::_InjectAllPhase1()
+{
+    assert(gMeshNet != nullptr);
+    const Mesh *mesh    = static_cast<const Mesh *>(gMeshNet);
+    const int   cl      = 0;
+    const int   half    = _GetNextPacketSize(cl) / 2;
+
+    _cp_phase1_start_cycle = _time;
+
+    for ( int node = 0; node < _nodes; ++node ) {
+        if ( mesh->IsCrossNode(node) ) continue;   // cross/center handled by barriers
+
+        const int row       = node / _cp_k;
+        const int col       = node % _cp_k;
+        const int col_cross = _CpColCrossForRow(row);
+        const int row_cross = _CpRowCrossForCol(col);
+
+        // Px: XY routing → col-cross of same row
+        _CpInjectPacket(node, col_cross, half, cl, /*is_px=*/true);
+        // Py: YX routing → row-cross of same col
+        _CpInjectPacket(node, row_cross, half, cl, /*is_px=*/false);
+    }
+
+    _cp_phase1_injected = true;
+}
+
+// ============================================================
+// Cross-Propagation All-Reduce — Phase 0.5: Cross → Center
+// ============================================================
+
+// Called when cross_node's local barrier fires (received all 4 outer packets).
+// Injects one aggregated-sum packet (D/2 flits) from cross_node to center.
+void TrafficManager::_InjectCrossToCenter( int cross_node )
+{
+    const int cl   = 0;
+    const int size = _GetNextPacketSize(cl) / 2;
+
+    _CpInjectPacket(cross_node, _cp_center, size, cl, /*is_px=*/true);
+}
+
+// ============================================================
+// Cross-Propagation All-Reduce — Phase 3: Center → 8 Cross
+// ============================================================
+
+// Called when the center global barrier fires (received all 8 cross packets).
+// Center injects D/2 flits to each of the 8 cross nodes.
+// Col-cross will forward as Px; row-cross will forward as Py.
+void TrafficManager::_InjectCenterToCross()
+{
+    assert(gMeshNet != nullptr);
+    const Mesh *mesh    = static_cast<const Mesh *>(gMeshNet);
+    const int   cl      = 0;
+    const int   size    = _GetNextPacketSize(cl) / 2;   // D/2 per cross node
+
+    for ( int node = 0; node < _nodes; ++node ) {
+        if ( !mesh->IsCrossNode(node) || mesh->IsCenterNode(node) ) continue;
+
+        _CpInjectPacket(_cp_center, node, size, cl, /*is_px=*/true);
+    }
+}
+
+// ============================================================
+// Cross-Propagation All-Reduce — Phase 4a: Col-Cross → Outer (Px)
+// ============================================================
+
+// Called when col_cross_node receives D/2 from center (Phase 3).
+// Broadcasts D/2 Px to each of its 4 outer nodes in the SAME ROW (horizontal).
+void TrafficManager::_InjectColCrossToOuter( int col_cross_node )
+{
+    const int cl   = 0;
+    const int size = _GetNextPacketSize(cl) / 2;   // D/2
+    const int row  = col_cross_node / _cp_k;
+    const int half = _cp_k / 2;
+
+    for ( int col = 0; col < _cp_k; ++col ) {
+        if ( col == half ) continue;   // skip center column
+        const int outer = row * _cp_k + col;
+        _CpInjectPacket(col_cross_node, outer, size, cl, /*is_px=*/true);
+    }
+}
+
+// ============================================================
+// Cross-Propagation All-Reduce — Phase 4b: Row-Cross → Outer (Py)
+// ============================================================
+
+// Called when row_cross_node receives D/2 from center (Phase 3).
+// Broadcasts D/2 Py to each of its 4 outer nodes in the SAME COLUMN (vertical).
+void TrafficManager::_InjectRowCrossToOuter( int row_cross_node )
+{
+    const int cl   = 0;
+    const int size = _GetNextPacketSize(cl) / 2;   // D/2
+    const int col  = row_cross_node % _cp_k;
+    const int half = _cp_k / 2;
+
+    for ( int row = 0; row < _cp_k; ++row ) {
+        if ( row == half ) continue;   // skip center row
+        const int outer = row * _cp_k + col;
+        _CpInjectPacket(row_cross_node, outer, size, cl, /*is_px=*/false);
+    }
+}
+
+// ============================================================
+
 void TrafficManager::_Inject(){
+
+    // Cross-Propagation: replace the normal per-cycle injection with a
+    // single one-shot bulk injection for Phase 1.  After that, Phase 2
+    // packets are enqueued directly by _TriggerPhase2(), so there is
+    // nothing for _Inject() to do on subsequent cycles.
+    if(_cp_enabled) {
+        if(!_cp_phase1_injected) {
+            _InjectAllPhase1();
+        }
+        return;
+    }
 
     for ( int input = 0; input < _nodes; ++input ) {
         for ( int c = 0; c < _classes; ++c ) {
             // Potentially generate packets for any (input,class)
-            // that is currently empty
-            if ( _partial_packets[input][c].empty() ) {
+            // that is currently empty (normal mode always uses slot 0)
+            if ( _partial_packets[input][0][c].empty() ) {
                 bool generated = false;
                 while( !generated && ( _qtime[input][c] <= _time ) ) {
                     int stype = _IssuePacket( input, c );
@@ -985,20 +1339,28 @@ void TrafficManager::_Step( )
                 }
             }
 
-            Credit * const c = _net[subnet]->ReadCredit( n );
-            if ( c ) {
+            {
+                const Mesh * cmesh = dynamic_cast<const Mesh *>(_net[subnet]);
+                int ni = cmesh ? cmesh->NumInjectionSlots(n) : 1;
+                for ( int slot = 0; slot < ni; ++slot ) {
+                    Credit * const c = cmesh
+                        ? cmesh->ReadCreditFromSlot(n, slot)
+                        : _net[subnet]->ReadCredit(n);
+                    if ( c ) {
 #ifdef TRACK_FLOWS
-                for(set<int>::const_iterator iter = c->vc.begin(); iter != c->vc.end(); ++iter) {
-                    int const vc = *iter;
-                    assert(!_outstanding_classes[n][subnet][vc].empty());
-                    int cl = _outstanding_classes[n][subnet][vc].front();
-                    _outstanding_classes[n][subnet][vc].pop();
-                    assert(_outstanding_credits[cl][subnet][n] > 0);
-                    --_outstanding_credits[cl][subnet][n];
-                }
+                        for(set<int>::const_iterator iter = c->vc.begin(); iter != c->vc.end(); ++iter) {
+                            int const vc = *iter;
+                            assert(!_outstanding_classes[n][subnet][vc].empty());
+                            int cl = _outstanding_classes[n][subnet][vc].front();
+                            _outstanding_classes[n][subnet][vc].pop();
+                            assert(_outstanding_credits[cl][subnet][n] > 0);
+                            --_outstanding_credits[cl][subnet][n];
+                        }
 #endif
-                _buf_states[n][subnet]->ProcessCredit(c);
-                c->Free();
+                        _buf_states[n][slot][subnet]->ProcessCredit(c);
+                        c->Free();
+                    }
+                }
             }
         }
         _net[subnet]->ReadInputs( );
@@ -1012,22 +1374,27 @@ void TrafficManager::_Step( )
 
         for(int n = 0; n < _nodes; ++n) {
 
+            const Mesh * mesh_inject = dynamic_cast<const Mesh *>(_net[subnet]);
+            int ni = mesh_inject ? mesh_inject->NumInjectionSlots(n) : 1;
+
+            for(int slot = 0; slot < ni; ++slot) {
+
             Flit * f = NULL;
 
-            BufferState * const dest_buf = _buf_states[n][subnet];
+            BufferState * const dest_buf = _buf_states[n][slot][subnet];
 
-            int const last_class = _last_class[n][subnet];
+            int const last_class = _last_class[n][slot][subnet];
 
             int class_limit = _classes;
 
             if(_hold_switch_for_packet) {
-                list<Flit *> const & pp = _partial_packets[n][last_class];
-                if(!pp.empty() && !pp.front()->head && 
+                list<Flit *> const & pp = _partial_packets[n][slot][last_class];
+                if(!pp.empty() && !pp.front()->head &&
                    !dest_buf->IsFullFor(pp.front()->vc)) {
                     f = pp.front();
-                    assert(f->vc == _last_vc[n][subnet][last_class]);
+                    assert(f->vc == _last_vc[n][slot][subnet][last_class]);
 
-                    // if we're holding the connection, we don't need to check that class 
+                    // if we're holding the connection, we don't need to check that class
                     // again in the for loop
                     --class_limit;
                 }
@@ -1037,7 +1404,7 @@ void TrafficManager::_Step( )
 
                 int const c = (last_class + i) % _classes;
 
-                list<Flit *> const & pp = _partial_packets[n][c];
+                list<Flit *> const & pp = _partial_packets[n][slot][c];
 
                 if(pp.empty()) {
                     continue;
@@ -1046,7 +1413,7 @@ void TrafficManager::_Step( )
                 Flit * const cf = pp.front();
                 assert(cf);
                 assert(cf->cl == c);
-	
+
                 if(cf->subnetwork != subnet) {
                     continue;
                 }
@@ -1056,7 +1423,7 @@ void TrafficManager::_Step( )
                 }
 
                 if(cf->head && cf->vc == -1) { // Find first available VC
-	  
+
                     OutputSet route_set;
                     _rf(NULL, cf, -1, &route_set, true);
                     set<OutputSet::sSetElement> const & os = route_set.GetSet();
@@ -1073,8 +1440,8 @@ void TrafficManager::_Step( )
                         assert(router);
                         int in_channel = inject->GetSinkPort();
 
-                        // NOTE: Because the lookahead is not for injection, but for the 
-                        // first hop, we have to temporarily set cf's VC to be non-negative 
+                        // NOTE: Because the lookahead is not for injection, but for the
+                        // first hop, we have to temporarily set cf's VC to be non-negative
                         // in order to avoid seting of an assertion in the routing function.
                         cf->vc = vc_start;
                         _rf(router, cf, in_channel, &cf->la_route_set, false);
@@ -1102,7 +1469,7 @@ void TrafficManager::_Step( )
                                    << ":" << endl;
                     }
                     for(int i = 1; i <= vc_count; ++i) {
-                        int const lvc = _last_vc[n][subnet][c];
+                        int const lvc = _last_vc[n][slot][subnet][c];
                         int const vc =
                             (lvc < vc_start || lvc > vc_end) ?
                             vc_start :
@@ -1130,7 +1497,7 @@ void TrafficManager::_Step( )
                         }
                     }
                 }
-	
+
                 if(cf->vc == -1) {
                     if(cf->watch) {
                         *gWatchOut << GetSimTime() << " | " << FullName() << " | "
@@ -1158,7 +1525,7 @@ void TrafficManager::_Step( )
                 int const c = f->cl;
 
                 if(f->head) {
-	  
+
                     if (_lookahead_routing) {
                         if(!_noq) {
                             const FlitChannel * inject = _net[subnet]->GetInject(n);
@@ -1183,12 +1550,12 @@ void TrafficManager::_Step( )
                     }
 
                     dest_buf->TakeBuffer(f->vc);
-                    _last_vc[n][subnet][c] = f->vc;
+                    _last_vc[n][slot][subnet][c] = f->vc;
                 }
-	
-                _last_class[n][subnet] = c;
 
-                _partial_packets[n][c].pop_front();
+                _last_class[n][slot][subnet] = c;
+
+                _partial_packets[n][slot][c].pop_front();
 
 #ifdef TRACK_FLOWS
                 ++_outstanding_credits[c][subnet][n];
@@ -1196,12 +1563,12 @@ void TrafficManager::_Step( )
 #endif
 
                 dest_buf->SendingFlit(f);
-	
+
                 if(_pri_type == network_age_based) {
                     f->pri = numeric_limits<int>::max() - _time;
                     assert(f->pri >= 0);
                 }
-	
+
                 if(f->watch) {
                     *gWatchOut << GetSimTime() << " | "
                                << "node" << n << " | "
@@ -1214,25 +1581,27 @@ void TrafficManager::_Step( )
                 f->itime = _time;
 
                 // Pass VC "back"
-                if(!_partial_packets[n][c].empty() && !f->tail) {
-                    Flit * const nf = _partial_packets[n][c].front();
+                if(!_partial_packets[n][slot][c].empty() && !f->tail) {
+                    Flit * const nf = _partial_packets[n][slot][c].front();
                     nf->vc = f->vc;
                 }
-	
+
                 if((_sim_state == warming_up) || (_sim_state == running)) {
                     ++_sent_flits[c][n];
                     if(f->head) {
                         ++_sent_packets[c][n];
                     }
                 }
-	
+
 #ifdef TRACK_FLOWS
                 ++_injected_flits[c][n];
 #endif
-	
+
                 _net[subnet]->WriteFlit(f, n);
-	
+
             }
+
+            } // for slot
         }
     }
 
@@ -1423,19 +1792,24 @@ bool TrafficManager::_SingleSim( )
     vector<double> prev_accepted(_classes, 0.0);
     bool clear_last = false;
     int total_phases = 0;
-    while( ( total_phases < _max_samples ) && 
-           ( ( _sim_state != running ) || 
+    while( ( total_phases < _max_samples ) &&
+           ( ( _sim_state != running ) ||
              ( converged < 3 ) ) ) {
-    
+
         if ( clear_last || (( ( _sim_state == warming_up ) && ( ( total_phases % 2 ) == 0 ) )) ) {
             clear_last = false;
             _ClearStats( );
         }
-    
-    
-        for ( int iter = 0; iter < _sample_period; ++iter )
+
+        for ( int iter = 0; iter < _sample_period; ++iter ) {
             _Step( );
-    
+            // Cross-Propagation: All-Reduce finished — stop immediately after
+            // the step in which _RetireFlit printed the completion message.
+            if ( _cp_enabled && _cp_phase == 2 ) {
+                goto cp_allreduce_done;
+            }
+        }
+
         //cout << _sim_state << endl;
 
         UpdateStats();
@@ -1543,9 +1917,15 @@ bool TrafficManager::_SingleSim( )
         ++total_phases;
     }
   
+    cp_allreduce_done:
+    // Cross-Propagation early exit: skip all draining and return success.
+    if ( _cp_enabled && _cp_phase == 2 ) {
+        return true;
+    }
+
     if ( _sim_state == running ) {
         ++converged;
-    
+
         _sim_state  = draining;
         _drain_time = _time;
 
@@ -1947,7 +2327,7 @@ void TrafficManager::UpdateStats() {
 #ifdef TRACK_CREDITS
     for(int s = 0; s < _subnets; ++s) {
         for(int n = 0; n < _nodes; ++n) {
-            BufferState const * const bs = _buf_states[n][s];
+            BufferState const * const bs = _buf_states[n][0][s];
             for(int v = 0; v < _vcs; ++v) {
                 if(_used_credits_out) *_used_credits_out << bs->OccupancyFor(v) << ',';
                 if(_free_credits_out) *_free_credits_out << bs->AvailableFor(v) << ',';
@@ -1971,7 +2351,9 @@ void TrafficManager::UpdateStats() {
 }
 
 void TrafficManager::DisplayStats(ostream & os) const {
-  
+
+    if ( _cp_enabled ) return;   // CP mode uses its own summary block
+
     for(int c = 0; c < _classes; ++c) {
     
         if(_measure_stats[c] == 0) {
@@ -2081,6 +2463,8 @@ void TrafficManager::DisplayStats(ostream & os) const {
 }
 
 void TrafficManager::DisplayOverallStats( ostream & os ) const {
+
+    if ( _cp_enabled ) return;   // CP mode uses its own summary block
 
     os << "====== Overall Traffic Statistics ======" << endl;
     for ( int c = 0; c < _classes; ++c ) {

@@ -42,14 +42,16 @@
  //#include "iq_router.hpp"
 
 
-KNCube::KNCube( const Configuration &config, const string & name, bool mesh ) :
+KNCube::KNCube( const Configuration &config, const string & name, bool mesh, bool defer_build ) :
 Network( config, name )
 {
   _mesh = mesh;
 
   _ComputeSize( config );
   _Alloc( );
-  _BuildNet( config );
+  if ( !defer_build ) {
+    _BuildNet( config );
+  }
 }
 
 void KNCube::_ComputeSize( const Configuration &config )

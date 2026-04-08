@@ -47,7 +47,7 @@ class KNCube : public Network {
   int _RightNode( int node, int dim );
 
 public:
-  KNCube( const Configuration &config, const string & name, bool mesh );
+  KNCube( const Configuration &config, const string & name, bool mesh, bool defer_build = false );
   static void RegisterRoutingFunctions();
 
   int GetN( ) const;

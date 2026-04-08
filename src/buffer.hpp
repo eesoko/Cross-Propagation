@@ -143,6 +143,9 @@ public:
     return _occupancy;
   }
 
+  inline int  GetSize() const { return _size; }
+  inline void SetSize(int s)  { _size = s; }
+
   inline int GetOccupancy( int vc ) const
   {
     return _vc[vc]->GetOccupancy( );

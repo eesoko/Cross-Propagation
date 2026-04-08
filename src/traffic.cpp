@@ -28,8 +28,10 @@
 #include <iostream>
 #include <sstream>
 #include <ctime>
+#include <cassert>
 #include "random_utils.hpp"
 #include "traffic.hpp"
+#include "mesh.hpp"
 
 TrafficPattern::TrafficPattern(int nodes)
 : _nodes(nodes)
@@ -191,6 +193,19 @@ TrafficPattern * TrafficPattern::New(string const & pattern, int nodes,
       rates.resize(hotspots.size(), 1);
     }
     result = new HotSpotTrafficPattern(nodes, hotspots, rates);
+  } else if(pattern_name == "cross_propagation") {
+    int k = -1;
+    if(params.size() < 1) {
+      if(config) {
+	k = config->GetInt("k");
+      } else {
+	cout << "Error: Missing parameter k for cross_propagation traffic pattern: " << pattern << endl;
+	exit(-1);
+      }
+    } else {
+      k = atoi(params[0].c_str());
+    }
+    result = new CrossPropagationTrafficPattern(nodes, k);
   } else {
     cout << "Error: Unknown traffic pattern: " << pattern << endl;
     exit(-1);
@@ -523,4 +538,54 @@ int HotSpotTrafficPattern::dest(int source)
   }
   assert(_rates.back() > pct);
   return _hotspots.back();
+}
+
+//=============================================================
+// Cross Propagation Phase 1 traffic pattern
+//=============================================================
+
+CrossPropagationTrafficPattern::CrossPropagationTrafficPattern(int nodes, int k)
+  : TrafficPattern(nodes), _k(k), _toggle(nodes, 0)
+{
+  assert(nodes == k * k);
+  assert(gMeshNet != nullptr);
+}
+
+void CrossPropagationTrafficPattern::reset()
+{
+  fill(_toggle.begin(), _toggle.end(), 0);
+}
+
+int CrossPropagationTrafficPattern::dest(int source)
+{
+  assert((source >= 0) && (source < _nodes));
+  assert(gMeshNet != nullptr);
+
+  const Mesh *mesh = static_cast<const Mesh *>(gMeshNet);
+  const int center = _k / 2;
+
+  // Center node: no injection in Phase 1; return self as sentinel.
+  if(mesh->IsCenterNode(source)) {
+    return source;
+  }
+
+  // Cross (non-center) node: send the full packet to the center node.
+  if(mesh->IsCrossNode(source)) {
+    return center * _k + center;
+  }
+
+  // Outer (non-cross) node: alternate between Px and Py each call.
+  //   Px (toggle=0): same row, center column  → row * k + center
+  //   Py (toggle=1): center row, same column  → center * k + col
+  const int row = source / _k;
+  const int col = source % _k;
+
+  int d;
+  if(_toggle[source] == 0) {
+    d = row * _k + center;   // Px: toward center column
+  } else {
+    d = center * _k + col;   // Py: toward center row
+  }
+  _toggle[source] ^= 1;
+  return d;
 }

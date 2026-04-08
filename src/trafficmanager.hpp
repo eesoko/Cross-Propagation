@@ -81,7 +81,7 @@ protected:
 
   vector<int> _class_priority;
 
-  vector<vector<int> > _last_class;
+  vector<vector<vector<int> > > _last_class;  // [node][slot][subnet]
 
   vector<TrafficPattern *> _traffic_pattern;
   vector<InjectionProcess *> _injection_process;
@@ -94,12 +94,12 @@ protected:
 
   // ============ Injection VC states  ============ 
 
-  vector<vector<BufferState *> > _buf_states;
+  vector<vector<vector<BufferState *> > > _buf_states;  // [node][slot][subnet]
 #ifdef TRACK_FLOWS
   vector<vector<vector<int> > > _outstanding_credits;
   vector<vector<vector<queue<int> > > > _outstanding_classes;
 #endif
-  vector<vector<vector<int> > > _last_vc;
+  vector<vector<vector<vector<int> > > > _last_vc;  // [node][slot][subnet][class]
 
   // ============ Routing ============ 
 
@@ -111,7 +111,7 @@ protected:
 
   vector<vector<int> > _qtime;
   vector<vector<bool> > _qdrained;
-  vector<vector<list<Flit *> > > _partial_packets;
+  vector<vector<vector<list<Flit *> > > > _partial_packets;  // [node][slot][class]
 
   vector<map<int, Flit *> > _total_in_flight_flits;
   vector<map<int, Flit *> > _measured_in_flight_flits;
@@ -268,9 +268,88 @@ protected:
   void _Step( );
 
   bool _PacketsOutstanding( ) const;
-  
+
   virtual int  _IssuePacket( int source, int cl );
   void _GeneratePacket( int source, int size, int cl, int time );
+
+  // ============ Cross-Propagation All-Reduce (Hierarchical 4-Phase) ============
+  //
+  // State machine:
+  //   _cp_phase == 0 : Phase 1 – Outer → Cross  (local barrier per cross node)
+  //                    Phase 2 – Cross → Center  (global barrier at center)
+  //   _cp_phase == 1 : Phase 3 – Center → 8 Cross
+  //                    Phase 4 – Col-Cross → Outer (D/2 Px, horizontal)
+  //                              Row-Cross → Outer (D/2 Py, vertical)
+  //   _cp_phase == 2 : done
+  //
+  // Cross node index mapping (0-7):
+  //   col-cross : N(r, k/2) → index r  for r in {0,1,3,4}  (0-based rows, skipping center)
+  //   row-cross : N(k/2, c) → index 4+ for c in {0,1,3,4}
+  //   Concretely for k=5: N2→0, N7→1, N17→2, N22→3, N10→4, N11→5, N13→6, N14→7
+
+  // true when traffic pattern is "cross_propagation"
+  bool _cp_enabled;
+  // true after the one-shot Phase 0 bulk injection (outer→cross) has fired
+  bool _cp_phase1_injected;
+  // center node ID = (k/2)*k + (k/2)
+  int  _cp_center;
+  // mesh dimension k (cached from gK)
+  int  _cp_k;
+  // current phase: 0 = reduce in progress, 1 = broadcast in progress, 2 = done
+  int  _cp_phase;
+
+  // --- Phase 0 local barriers (one per cross node, index 0-7) ---
+  // Number of tail packets received at each cross node from outer nodes.
+  // Threshold = 4 (each cross node has 4 assigned outer nodes).
+  int  _cp_cross_recv[8];
+  // Whether this cross node has already injected its aggregated packet to center.
+  bool _cp_cross_sent[8];
+
+  // --- Phase 0.5 global barrier (at center) ---
+  // Number of tail packets received at center from cross nodes. Threshold = 8.
+  int  _cp_center_recv;
+
+  // --- Phase 1 sub-barriers (one per cross node) ---
+  // Whether each cross node has received the broadcast packet from center.
+  bool _cp_cross_p2_recv[8];
+
+  // --- Phase 1.5 end barrier ---
+  // Number of tail packets received at outer nodes from col-cross nodes. Threshold = 16.
+  int  _cp_outer_recv;
+
+  // --- Timing ---
+  int  _cp_phase1_start_cycle;   // cycle when Phase 0 injection fired
+  int  _cp_phase1_end_cycle;     // cycle when center global barrier fired
+  int  _cp_phase2_end_cycle;     // cycle when last outer node received Phase 1.5 packet
+
+  // --- Traffic volume ---
+  int  _cp_total_flits;          // total flits injected across all CP phases
+
+  // --- Node classification helpers ---
+  // Returns true if node is a col-cross node (on center col, not center row).
+  bool _CpIsColCross( int node ) const;
+  // Returns true if node is a row-cross node (on center row, not center col).
+  bool _CpIsRowCross( int node ) const;
+  // Returns cross-node array index (0-7) for a cross (non-center) node.
+  int  _CpCrossIndex( int node ) const;
+  // Returns the col-cross node ID for a given row  (= row * k + k/2).
+  int  _CpColCrossForRow( int row ) const;
+  // Returns the row-cross node ID for a given col  (= (k/2)*k + col).
+  int  _CpRowCrossForCol( int col ) const;
+
+  // --- Injection helpers ---
+  // Enqueue one packet with explicit src/dest/size/routing flag.
+  void _CpInjectPacket( int src, int dest, int size, int cl, bool is_px );
+  // Phase 0  : enqueue all outer-node Px/Py packets (outer → cross).
+  void _InjectAllPhase1();
+  // Phase 0.5: cross node injects its aggregated sum to center.
+  void _InjectCrossToCenter( int cross_node );
+  // Phase 1  : center injects broadcast packets to all 8 cross nodes.
+  void _InjectCenterToCross();
+  // Phase 4a: col-cross node injects D/2 Px packets to its 4 outer nodes (horizontal).
+  void _InjectColCrossToOuter( int col_cross_node );
+  // Phase 4b: row-cross node injects D/2 Py packets to its 4 outer nodes (vertical).
+  void _InjectRowCrossToOuter( int row_cross_node );
 
   virtual void _ClearStats( );
 

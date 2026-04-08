@@ -77,6 +77,9 @@ public:
   // phase in multi-phase algorithms
   mutable int ph;
 
+  // Routing direction flag: true = XY routing (X first), false = YX routing (Y first)
+  bool is_px;
+
   // Fields for arbitrary data
   void* data ;
 

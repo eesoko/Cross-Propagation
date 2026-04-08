@@ -166,9 +166,31 @@ private:
   vector<int> _rates;
   int _max_val;
 public:
-  HotSpotTrafficPattern(int nodes, vector<int> hotspots, 
+  HotSpotTrafficPattern(int nodes, vector<int> hotspots,
 			vector<int> rates = vector<int>());
   virtual int dest(int source);
+};
+
+// Cross Propagation Phase 1 traffic pattern for Fat-Bus Mesh.
+//
+// Outer nodes (non-cross): alternate each dest() call between
+//   Px → same row's center-column node  (col = k/2)
+//   Py → center-row node in same column  (row = k/2)
+// Cross nodes (non-center): always send to the single center node.
+// Center node: returns itself (no meaningful injection in Phase 1;
+//              set injection_rate = 0 for the center node externally).
+//
+// The toggle-based alternation models the "two simultaneous packets"
+// intent within the single-destination-per-call TrafficPattern interface.
+// Actual per-packet flit counts (packet_size / 2) must be configured
+// at the trafficmanager / config level.
+class CrossPropagationTrafficPattern : public TrafficPattern {
+  int        _k;
+  vector<int> _toggle;  // per-source: 0 → Px, 1 → Py
+public:
+  CrossPropagationTrafficPattern(int nodes, int k);
+  virtual void reset();
+  virtual int  dest(int source);
 };
 
 #endif

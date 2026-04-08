@@ -49,6 +49,7 @@
 #include "tree4.hpp"
 #include "qtree.hpp"
 #include "cmesh.hpp"
+#include "mesh.hpp"
 
 
 
@@ -1913,6 +1914,135 @@ void chaos_mesh( const Router *r, const Flit *f,
 }
 
 //=============================================================
+// Cross Propagation DOR (Fat-Bus Mesh)
+//
+// Port layout per router (output side, matches Mesh::_BuildNet Pass 3):
+//   [0 .. par_E-1]                     : East  (dim=0, right)
+//   [par_E .. par_E+par_W-1]           : West  (dim=0, left)
+//   [par_E+par_W .. par_E+par_W+par_S-1]: South (dim=1, right)
+//   [par_E+par_W+par_S .. base_N+par_N-1]: North (dim=1, left)
+//   [par_E+par_W+par_S+par_N]          : Local (eject)
+//
+// par_X = _NumParallel(cur, X-neighbor):
+//   4 if either endpoint is the center node,
+//   2 if either endpoint is a cross node (but not center),
+//   1 otherwise.
+//
+// DOR order: X-dimension first, then Y-dimension.
+// Returns the first port of the chosen direction group; parallel-channel
+// selection within the group is left to the VC allocator.
+//=============================================================
+
+void cross_propagation_dor( const Router *r, const Flit *f,
+                             int in_channel, OutputSet *outputs, bool inject )
+{
+  int vcBegin = 0, vcEnd = gNumVCs - 1;
+  if ( f->type == Flit::READ_REQUEST ) {
+    vcBegin = gReadReqBeginVC;  vcEnd = gReadReqEndVC;
+  } else if ( f->type == Flit::WRITE_REQUEST ) {
+    vcBegin = gWriteReqBeginVC; vcEnd = gWriteReqEndVC;
+  } else if ( f->type == Flit::READ_REPLY ) {
+    vcBegin = gReadReplyBeginVC; vcEnd = gReadReplyEndVC;
+  } else if ( f->type == Flit::WRITE_REPLY ) {
+    vcBegin = gWriteReplyBeginVC; vcEnd = gWriteReplyEndVC;
+  }
+  assert( ( ( f->vc >= vcBegin ) && ( f->vc <= vcEnd ) ) ||
+          ( inject && ( f->vc < 0 ) ) );
+
+  int out_port;
+
+  if ( inject ) {
+
+    out_port = -1;
+
+  } else {
+
+    assert( gMeshNet != nullptr );
+
+    const int cur  = r->GetID();
+    const int dest = f->dest;
+
+    // Neighbor computation (wrap-around, consistent with Mesh::_BuildNet).
+    // For a mesh the routing function never chooses a wrap direction, so
+    // correctness is unaffected.
+    auto right_nb = [&]( int node, int dim ) -> int {
+      const int kd  = ( dim == 0 ) ? 1 : gK;
+      const int loc = ( node / kd ) % gK;
+      return ( loc == gK - 1 ) ? node - ( gK - 1 ) * kd : node + kd;
+    };
+    auto left_nb = [&]( int node, int dim ) -> int {
+      const int kd  = ( dim == 0 ) ? 1 : gK;
+      const int loc = ( node / kd ) % gK;
+      return ( loc == 0 ) ? node + ( gK - 1 ) * kd : node - kd;
+    };
+
+    // _NumParallel: cast gMeshNet to Mesh* to access IsCrossNode / IsCenterNode.
+    auto num_parallel = [&]( int a, int b ) -> int {
+      const Mesh *mesh = static_cast<const Mesh *>( gMeshNet );
+      if ( mesh->IsCenterNode( a ) || mesh->IsCenterNode( b ) ) return 4;
+      if ( mesh->IsCrossNode( a )  || mesh->IsCrossNode( b )  ) return 2;
+      return 1;
+    };
+
+    // Per-direction parallel channel counts for the current node.
+    const int par_E = num_parallel( cur, right_nb( cur, 0 ) );
+    const int par_W = num_parallel( cur, left_nb(  cur, 0 ) );
+    const int par_S = num_parallel( cur, right_nb( cur, 1 ) );
+    const int par_N = num_parallel( cur, left_nb(  cur, 1 ) );
+
+    // Port base addresses.
+    const int base_E = 0;
+    const int base_W = base_E + par_E;
+    const int base_S = base_W + par_W;
+    const int base_N = base_S + par_S;
+    const int base_L = base_N + par_N;
+
+    const int cur_col  = cur  % gK;
+    const int dest_col = dest % gK;
+    const int cur_row  = cur  / gK;
+    const int dest_row = dest / gK;
+
+    if ( f->is_px ) {
+      // XY routing: X direction first, then Y.
+      if ( cur_col != dest_col ) {
+        out_port = ( dest_col > cur_col ) ? base_E : base_W;
+      } else if ( cur_row != dest_row ) {
+        out_port = ( dest_row > cur_row ) ? base_S : base_N;
+      } else {
+        out_port = base_L;
+      }
+    } else {
+      // YX routing: Y direction first, then X.
+      if ( cur_row != dest_row ) {
+        out_port = ( dest_row > cur_row ) ? base_S : base_N;
+      } else if ( cur_col != dest_col ) {
+        out_port = ( dest_col > cur_col ) ? base_E : base_W;
+      } else {
+        out_port = base_L;
+      }
+    }
+
+
+
+    if ( f->watch ) {
+      *gWatchOut << GetSimTime() << " | " << r->FullName() << " | "
+                 << "cross_propagation_dor: VC range ["
+                 << vcBegin << "," << vcEnd << "]"
+                 << " out_port=" << out_port
+                 << " (par E/W/S/N=" << par_E << "/" << par_W
+                 << "/" << par_S << "/" << par_N << ")"
+                 << " flit=" << f->id
+                 << " in_port=" << in_channel
+                 << " dest=" << dest
+                 << endl;
+    }
+  }
+
+  outputs->Clear();
+  outputs->AddRange( out_port, vcBegin, vcEnd );
+}
+
+//=============================================================
 
 void InitializeRoutingMap( const Configuration & config )
 {
@@ -1996,4 +2126,6 @@ void InitializeRoutingMap( const Configuration & config )
 
   gRoutingFunctionMap["chaos_mesh"]  = &chaos_mesh;
   gRoutingFunctionMap["chaos_torus"] = &chaos_torus;
+
+  gRoutingFunctionMap["cross_propagation_dor_mesh"] = &cross_propagation_dor;
 }
