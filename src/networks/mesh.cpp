@@ -128,6 +128,8 @@ Mesh::~Mesh()
   for ( int node = 0; node < _size; ++node ) {
     for ( auto *ch : _inject_aux[node]      ) delete ch;
     for ( auto *ch : _inject_aux_cred[node] ) delete ch;
+    for ( auto *ch : _eject_extra[node]      ) delete ch;
+    for ( auto *ch : _eject_extra_cred[node] ) delete ch;
   }
 }
 
@@ -168,8 +170,14 @@ int Mesh::_NumParallel( int a, int b ) const
 int Mesh::_NumInjectionSlots( int node ) const
 {
   if ( IsCenterNode( node ) ) return 4;  // N / S / E / W
-  if ( IsCrossNode( node )  ) return 1;
+  if ( IsCrossNode( node )  ) return 2;  // Phase4: directional (west/east or north/south)
   return 2;                               // Px (XY) / Py (YX)
+}
+
+int Mesh::_NumEjectionSlots( int node ) const
+{
+  if ( IsCenterNode( node ) ) return 4;  // N / S / E / W
+  return 2;                               // outer: Px/Py, cross: 2 directional
 }
 
 void Mesh::_BuildNet( const Configuration &config )
@@ -251,6 +259,30 @@ void Mesh::_BuildNet( const Configuration &config )
   }
 
   // ----------------------------------------------------------------
+  // Allocate auxiliary ejection output channels (slots 1+) per node.
+  // Slot 0 is the base-class _eject[node]; extra slots live here.
+  // Only center node currently has ne > 1.
+  // ----------------------------------------------------------------
+  _eject_extra.resize( _size );
+  _eject_extra_cred.resize( _size );
+  for ( int node = 0; node < _size; ++node ) {
+    int ne = _NumEjectionSlots( node );
+    _eject_extra[node].resize( ne - 1, nullptr );
+    _eject_extra_cred[node].resize( ne - 1, nullptr );
+    for ( int s = 1; s < ne; ++s ) {
+      ostringstream fname, cname;
+      fname << Name() << "_fchan_egress" << node << "_" << s;
+      cname << Name() << "_cchan_egress" << node << "_" << s;
+      auto *fc = new FlitChannel( this, fname.str(), _classes );
+      auto *cc = new CreditChannel( this, cname.str() );
+      _timed_modules.push_back( fc );
+      _timed_modules.push_back( cc );
+      _eject_extra[node][s - 1]      = fc;
+      _eject_extra_cred[node][s - 1] = cc;
+    }
+  }
+
+  // ----------------------------------------------------------------
   // Pass 2: Create routers with the correct per-node port counts.
   //
   // out_ports = routing channels + 1 ejection  (unchanged)
@@ -266,8 +298,9 @@ void Mesh::_BuildNet( const Configuration &config )
     }
 
     int ni_count = _NumInjectionSlots( node );
+    int ne_count = _NumEjectionSlots( node );
     int in_ports  = routing + ni_count;  // extra NI inject slots
-    int out_ports = routing + 1;         // single ejection port
+    int out_ports = routing + ne_count;  // ejection port(s): 1 normally, 4 for center
 
     rname.str( "" );
     rname << "router";
@@ -353,9 +386,17 @@ void Mesh::_BuildNet( const Configuration &config )
       _inject_aux_cred[node][s]->SetLatency( 1 );
     }
 
-    // Single ejection port per node (unchanged).
+    // Ejection slot 0 (primary, base-class channel).
     _routers[node]->AddOutputChannel( _eject[node], _eject_cred[node] );
     _eject[node]->SetLatency( 1 );
+
+    // Ejection slots 1+ (center node only: S, E, W).
+    for ( int s = 0; s < (int)_eject_extra[node].size(); ++s ) {
+      _routers[node]->AddOutputChannel( _eject_extra[node][s],
+                                        _eject_extra_cred[node][s] );
+      _eject_extra[node][s]->SetLatency( 1 );
+      _eject_extra_cred[node][s]->SetLatency( 1 );
+    }
   }
 
   // ----------------------------------------------------------------
@@ -434,6 +475,22 @@ int Mesh::NumInjectionSlots( int source ) const
   return _NumInjectionSlots( source );
 }
 
+int Mesh::NumEjectionSlots( int dest ) const
+{
+  return _NumEjectionSlots( dest );
+}
+
+Flit * Mesh::ReadFlitFromEjectSlot( int dest, int slot ) const
+{
+  assert( dest >= 0 && dest < _nodes );
+  assert( slot >= 0 && slot < _NumEjectionSlots( dest ) );
+  if ( slot == 0 ) {
+    return _eject[dest]->Receive();
+  } else {
+    return _eject_extra[dest][slot - 1]->Receive();
+  }
+}
+
 Credit *Mesh::ReadCreditFromSlot( int source, int slot ) const
 {
   assert( source >= 0 && source < _nodes );
@@ -455,6 +512,20 @@ bool Mesh::IsCenterNode( int node ) const
 {
   assert( node >= 0 && node < _nodes );
   return _is_center_node[node];
+}
+
+// ----------------------------------------------------------------
+// WriteEjectCredit — send credit back on the correct ejection slot credit channel.
+// ----------------------------------------------------------------
+void Mesh::WriteEjectCredit( Credit *c, int dest, int slot )
+{
+  assert( dest >= 0 && dest < _nodes );
+  assert( slot >= 0 && slot < _NumEjectionSlots( dest ) );
+  if ( slot == 0 ) {
+    _eject_cred[dest]->Send( c );
+  } else {
+    _eject_extra_cred[dest][slot - 1]->Send( c );
+  }
 }
 
 // ----------------------------------------------------------------
@@ -509,8 +580,43 @@ void Mesh::WriteFlit( Flit *f, int source )
     }
 
   } else {
-    // Cross node (not center): single NI slot
-    _inject[source]->Send( f );
+    // Cross node (not center): 2 NI slots (directional).
+    // Phase 2 (→ center)  : slot 0.
+    // Phase 4 col-cross   : slot 0 = west  (dest_col < half)
+    //                       slot 1 = east  (dest_col > half)
+    // Phase 4 row-cross   : slot 0 = north (dest_row < half)
+    //                       slot 1 = south (dest_row > half)
+    int slot = 0;
+    if ( f->head ) {
+      const int k       = GetK();
+      const int half    = k / 2;
+      const int src_col = source % k;
+
+      if ( f->dest != -1 ) {
+        const int center   = half * k + half;
+        const int dest_row = f->dest / k;
+        const int dest_col = f->dest % k;
+
+        if ( f->dest == center ) {
+          slot = 0;                                      // Phase 2: to center
+        } else if ( src_col == half ) {
+          slot = ( dest_col < half ) ? 0 : 1;           // col-cross: W=0, E=1
+        } else {
+          slot = ( dest_row < half ) ? 0 : 1;           // row-cross: N=0, S=1
+        }
+      }
+      _cross_pkt_slot[f->pid] = slot;
+    } else {
+      auto it = _cross_pkt_slot.find( f->pid );
+      slot = ( it != _cross_pkt_slot.end() ) ? it->second : 0;
+    }
+    if ( f->tail ) _cross_pkt_slot.erase( f->pid );
+
+    if ( slot == 0 ) {
+      _inject[source]->Send( f );
+    } else {
+      _inject_aux[source][0]->Send( f );
+    }
   }
 }
 

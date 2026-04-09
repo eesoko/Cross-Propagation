@@ -59,19 +59,29 @@ class Mesh : public KNCube {
   int _NumParallel( int node_a, int node_b ) const;
 
   // Returns number of injection NI slots for a node:
-  //   outer node → 2  (slot 0 = Px/XY, slot 1 = Py/YX)
-  //   cross node → 1
-  //   center node → 4 (slot 0=N, 1=S, 2=E, 3=W)
+  //   outer node  → 2  (slot 0 = Px/XY, slot 1 = Py/YX)
+  //   cross node  → 4  (slot 0-3 = 4 outer destinations for Phase 4)
+  //   center node → 4  (slot 0=N, 1=S, 2=E, 3=W)
   int _NumInjectionSlots( int node ) const;
+
+  // Returns number of ejection slots for a node:
+  //   center node → 4  (slot 0=N, 1=S, 2=E, 3=W)
+  //   all others  → 1
+  int _NumEjectionSlots( int node ) const;
 
   // Extra injection NI channels (slots 1+) per node.
   // _inject_aux[node][s] corresponds to NI slot (s+1).
   vector<vector<FlitChannel *>>   _inject_aux;
   vector<vector<CreditChannel *>> _inject_aux_cred;
 
-  // For center node: cache (pid → NI slot) so body/tail flits
-  // use the same slot as their head flit.
+  // pid → NI slot cache for center and cross nodes (body/tail use same slot as head).
   mutable map<int, int> _center_pkt_slot;
+  mutable map<int, int> _cross_pkt_slot;
+
+  // Extra ejection output channels for center node (slots 1+).
+  // _eject_extra[node][s] corresponds to ejection slot (s+1).
+  vector<vector<FlitChannel *>>   _eject_extra;
+  vector<vector<CreditChannel *>> _eject_extra_cred;
 
   // Overrides KNCube's _BuildNet to wire parallel (fat-bus) channels.
   void _BuildNet( const Configuration &config );
@@ -91,9 +101,20 @@ public:
   // Returns the number of injection NI slots for source (1 / 2 / 4).
   int NumInjectionSlots( int source ) const;
 
+  // Returns the number of ejection slots for dest (1 or 4 for center).
+  int NumEjectionSlots( int dest ) const;
+
   // Read a credit from a specific NI slot (slot 0 = primary inject_cred,
   // slot 1+ = _inject_aux_cred[source][slot-1]).
   Credit * ReadCreditFromSlot( int source, int slot ) const;
+
+  // Read a flit from a specific ejection slot (slot 0 = primary _eject,
+  // slot 1+ = _eject_extra[dest][slot-1]).
+  Flit * ReadFlitFromEjectSlot( int dest, int slot ) const;
+
+  // Write a credit back to the correct ejection slot credit channel.
+  // slot 0 → _eject_cred[dest], slot 1+ → _eject_extra_cred[dest][slot-1].
+  void WriteEjectCredit( Credit *c, int dest, int slot );
 
   // Overrides: dispatch to the correct NI slot.
   void     WriteFlit  ( Flit   *f, int source ) override;

@@ -2002,23 +2002,56 @@ void cross_propagation_dor( const Router *r, const Flit *f,
     const int cur_row  = cur  / gK;
     const int dest_row = dest / gK;
 
-    if ( f->is_px ) {
+    if ( cur == dest ) {
+      // At destination: choose ejection port based on node type.
+      //   center (ne=4) : N=0, S=1, E=2, W=3  (determined by f->src direction)
+      //   outer  (ne=2) : slot 0 = Px (horizontal), slot 1 = Py (vertical)
+      //   cross  (ne=2) : slot 0 = west/north side, slot 1 = east/south side
+      const Mesh *mesh = static_cast<const Mesh *>( gMeshNet );
+      const int  ne    = mesh->NumEjectionSlots( cur );
+      const int  half  = gK / 2;
+      int dir = 0;
+
+      if ( ne == 4 ) {
+        // Center node
+        const int src_row = f->src / gK;
+        const int src_col = f->src % gK;
+        if      ( src_row < half ) dir = 0;   // North
+        else if ( src_row > half ) dir = 1;   // South
+        else if ( src_col > half ) dir = 2;   // East
+        else                       dir = 3;   // West
+      } else if ( !mesh->IsCrossNode( cur ) ) {
+        // Outer node: Px (col-cross, horizontal) → slot 0
+        //             Py (row-cross, vertical)   → slot 1
+        dir = f->is_px ? 0 : 1;
+      } else {
+        // Cross node: use f->src to determine which side packet came from.
+        //   col-cross (cur_col==half): src_col < half → west (slot 0), else east (slot 1)
+        //   row-cross (cur_row==half): src_row < half → north (slot 0), else south (slot 1)
+        //   from center → slot 0 (Phase 3)
+        const int center_id = half * gK + half;
+        if ( f->src == center_id ) {
+          dir = 0;
+        } else if ( cur_col == half ) {
+          dir = ( f->src % gK < half ) ? 0 : 1;
+        } else {
+          dir = ( f->src / gK < half ) ? 0 : 1;
+        }
+      }
+      out_port = base_L + dir;
+    } else if ( f->is_px ) {
       // XY routing: X direction first, then Y.
       if ( cur_col != dest_col ) {
         out_port = ( dest_col > cur_col ) ? base_E : base_W;
-      } else if ( cur_row != dest_row ) {
-        out_port = ( dest_row > cur_row ) ? base_S : base_N;
       } else {
-        out_port = base_L;
+        out_port = ( dest_row > cur_row ) ? base_S : base_N;
       }
     } else {
       // YX routing: Y direction first, then X.
       if ( cur_row != dest_row ) {
         out_port = ( dest_row > cur_row ) ? base_S : base_N;
-      } else if ( cur_col != dest_col ) {
-        out_port = ( dest_col > cur_col ) ? base_E : base_W;
       } else {
-        out_port = base_L;
+        out_port = ( dest_col > cur_col ) ? base_E : base_W;
       }
     }
 

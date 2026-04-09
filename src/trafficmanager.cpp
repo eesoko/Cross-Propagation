@@ -603,19 +603,24 @@ TrafficManager::TrafficManager( const Configuration &config, const vector<Networ
             break;
         }
     }
-    _cp_phase1_injected    = false;
-    _cp_k                  = gK;
-    _cp_center             = (_cp_k / 2) * _cp_k + (_cp_k / 2);
-    _cp_phase              = 0;
-    _cp_center_recv        = 0;
-    _cp_outer_recv         = 0;
-    _cp_phase1_start_cycle = -1;
-    _cp_phase1_end_cycle   = -1;
-    _cp_phase2_end_cycle   = -1;
-    _cp_total_flits        = 0;
+    _cp_phase1_injected        = false;
+    _cp_k                      = gK;
+    _cp_center                 = (_cp_k / 2) * _cp_k + (_cp_k / 2);
+    _cp_phase                  = 0;
+    _cp_center_recv            = 0;
+    _cp_outer_recv             = 0;
+    _cp_phase1_start_cycle     = -1;
+    _cp_phase1_local_end_cycle = -1;
+    _cp_phase2_end_cycle       = -1;
+    _cp_phase3_end_cycle       = -1;
+    _cp_phase4_end_cycle       = -1;
+    _cp_cross_all_sent_count   = 0;
+    _cp_cross_p2_recv_count    = 0;
+    _cp_total_flits            = 0;
+    _cp_trace = (config.GetInt("cp_trace") != 0);
     for ( int i = 0; i < 8; ++i ) {
-        _cp_cross_recv[i]   = 0;
-        _cp_cross_sent[i]   = false;
+        _cp_cross_recv[i]    = 0;
+        _cp_cross_sent[i]    = false;
         _cp_cross_p2_recv[i] = false;
     }
 
@@ -793,10 +798,22 @@ void TrafficManager::_RetireFlit( Flit *f, int dest )
     // All barrier logic fires on tail flits only (one event per packet).
     if ( _cp_enabled && f->tail ) {
 
+        // Verbose per-packet trace
+        if ( _cp_trace ) {
+            const char *phase_tag =
+                (_cp_phase == 0 && gMeshNet->IsCrossNode(dest) && !gMeshNet->IsCenterNode(dest)) ? "Phase1" :
+                (_cp_phase == 0 && dest == _cp_center)                                            ? "Phase2" :
+                (_cp_phase == 1 && gMeshNet->IsCrossNode(dest))                                   ? "Phase3" :
+                (_cp_phase == 1)                                                                   ? "Phase4" : "?";
+            cout << "[CP TRACE][Cycle " << _time << "] ARRIVE "
+                 << phase_tag << "  N" << f->src << " -> N" << dest
+                 << (f->is_px ? "  Px" : "  Py") << endl;
+        }
+
         if ( _cp_phase == 0 ) {
 
             // --------------------------------------------------
-            // Phase 1: outer → cross  (local barrier per cross node)
+            // Phase 1: outer → cross  (cross node collects from all neighbors)
             // --------------------------------------------------
             if ( gMeshNet->IsCrossNode(dest) && !gMeshNet->IsCenterNode(dest) ) {
                 const int idx = _CpCrossIndex(dest);
@@ -804,25 +821,36 @@ void TrafficManager::_RetireFlit( Flit *f, int dest )
 
                 if ( _cp_cross_recv[idx] == 4 && !_cp_cross_sent[idx] ) {
                     _cp_cross_sent[idx] = true;
-                    cout << "[CP] Phase1 local barrier fired: cross=" << dest
-                         << " cycle=" << _time << endl;
+                    ++_cp_cross_all_sent_count;
+                    cout << "[CP] Phase1: N" << f->src << " -> N" << dest
+                         << "(cross) all arrived"
+                         << "  (" << _cp_cross_all_sent_count << "/8)"
+                         << "  cycle=" << _time << endl;
+                    if ( _cp_cross_all_sent_count == 8 ) {
+                        _cp_phase1_local_end_cycle = _time;
+                        cout << "[CP] Phase1 DONE: all 8 cross nodes collected"
+                             << "  cycle=" << _time << endl;
+                    }
                     _InjectCrossToCenter(dest);
                 }
             }
 
             // --------------------------------------------------
-            // Phase 2: cross → center  (global barrier at center)
+            // Phase 2: cross → center  (center collects from all cross nodes)
             // --------------------------------------------------
             if ( dest == _cp_center ) {
                 ++_cp_center_recv;
+                cout << "[CP] Phase2: N" << f->src << "(cross) -> N" << dest
+                     << "(center) arrived"
+                     << "  (" << _cp_center_recv << "/8)"
+                     << "  cycle=" << _time << endl;
 
                 if ( _cp_center_recv == 8 ) {
-                    _cp_phase1_end_cycle = _time;
-                    cout << "[CP] Phase2 global barrier fired: reduce done"
-                         << "  cycle=" << _cp_phase1_end_cycle
-                         << "  reduce_latency="
-                         << (_cp_phase1_end_cycle - _cp_phase1_start_cycle)
-                         << " cycles" << endl;
+                    _cp_phase2_end_cycle = _time;
+                    const int reduce_lat = _cp_phase2_end_cycle - _cp_phase1_start_cycle;
+                    cout << "[CP] Phase2 DONE: all 8 cross nodes arrived at center"
+                         << "  cycle=" << _cp_phase2_end_cycle
+                         << "  reduce_latency=" << reduce_lat << " cycles" << endl;
                     _cp_phase = 1;
                     _InjectCenterToCross();
                 }
@@ -831,12 +859,22 @@ void TrafficManager::_RetireFlit( Flit *f, int dest )
         } else if ( _cp_phase == 1 ) {
 
             // --------------------------------------------------
-            // Phase 3: center → cross  (per-cross sub-barrier)
+            // Phase 3: center → cross  (each cross node receives broadcast)
             // --------------------------------------------------
             if ( gMeshNet->IsCrossNode(dest) && !gMeshNet->IsCenterNode(dest)
                  && f->src == _cp_center ) {
                 const int idx = _CpCrossIndex(dest);
                 _cp_cross_p2_recv[idx] = true;
+                ++_cp_cross_p2_recv_count;
+                cout << "[CP] Phase3: N" << f->src << "(center) -> N" << dest
+                     << "(cross) arrived"
+                     << "  (" << _cp_cross_p2_recv_count << "/8)"
+                     << "  cycle=" << _time << endl;
+                if ( _cp_cross_p2_recv_count == 8 ) {
+                    _cp_phase3_end_cycle = _time;
+                    cout << "[CP] Phase3 DONE: all 8 cross nodes received from center"
+                         << "  cycle=" << _time << endl;
+                }
 
                 if ( _CpIsColCross(dest) ) {
                     _InjectColCrossToOuter(dest);   // Phase 4a: D/2 Px horizontal
@@ -846,18 +884,27 @@ void TrafficManager::_RetireFlit( Flit *f, int dest )
             }
 
             // --------------------------------------------------
-            // Phase 4: cross → outer  (end barrier: 16 Px + 16 Py = 32 total)
+            // Phase 4: cross → outer  (32 outer nodes receive final result)
             // --------------------------------------------------
             if ( !gMeshNet->IsCrossNode(dest) ) {
                 ++_cp_outer_recv;
 
+                cout << "[CP] Phase4: N" << f->src << "(cross) -> N" << dest
+                     << "(outer) arrived"
+                     << "  (" << _cp_outer_recv << "/32)"
+                     << "  cycle=" << _time << endl;
+
                 if ( _cp_outer_recv == 32 ) {
-                    _cp_phase2_end_cycle = _time;
+                    _cp_phase4_end_cycle = _time;
                     _cp_phase = 2;
 
-                    const int reduce_lat    = _cp_phase1_end_cycle - _cp_phase1_start_cycle;
-                    const int broadcast_lat = _cp_phase2_end_cycle - _cp_phase1_end_cycle;
-                    const int total_lat     = _cp_phase2_end_cycle - _cp_phase1_start_cycle;
+                    const int p1_dur = _cp_phase1_local_end_cycle - _cp_phase1_start_cycle;
+                    const int p3_dur = (_cp_phase3_end_cycle >= 0)
+                                       ? (_cp_phase3_end_cycle - _cp_phase2_end_cycle) : -1;
+                    const int p4_dur = _cp_phase4_end_cycle - _cp_phase2_end_cycle;
+                    const int reduce_lat    = _cp_phase2_end_cycle - _cp_phase1_start_cycle;
+                    const int broadcast_lat = _cp_phase4_end_cycle - _cp_phase2_end_cycle;
+                    const int total_lat     = _cp_phase4_end_cycle - _cp_phase1_start_cycle;
                     const int pkt_size      = _GetNextPacketSize(0);
 
                     cout << "\n====== Cross-Propagation All-Reduce Summary ======\n"
@@ -865,15 +912,30 @@ void TrafficManager::_RetireFlit( Flit *f, int dest )
                          << " (" << _nodes << " nodes)\n"
                          << "  Packet size : D=" << pkt_size
                          << " flits  (Px/Py=" << pkt_size/2 << " flits)\n"
-                         << "  ---- Timing ----\n"
-                         << "  Reduce    (Phase 1+2): " << reduce_lat
-                         << " cycles  [outer→cross→center]\n"
-                         << "  Broadcast (Phase 3+4): " << broadcast_lat
-                         << " cycles  [center→cross→outer]\n"
-                         << "  Total All-Reduce     : " << total_lat
+                         << "  ---- Per-Phase Timing ----\n"
+                         << "  Phase 1 (Outer->Cross)  : " << p1_dur
+                         << " cycles  [cycle " << _cp_phase1_start_cycle
+                         << " ~ " << _cp_phase1_local_end_cycle << "]\n"
+                         << "  Phase 2 (Cross->Center) : "
+                         << (_cp_phase2_end_cycle - _cp_phase1_local_end_cycle)
+                         << " cycles  [cycle " << _cp_phase1_local_end_cycle
+                         << " ~ " << _cp_phase2_end_cycle << "]\n"
+                         << "  Phase 3 (Center->Cross) : " << p3_dur
+                         << " cycles  [cycle " << _cp_phase2_end_cycle
+                         << " ~ " << _cp_phase3_end_cycle << "]\n"
+                         << "  Phase 4 (Cross->Outer)  : " << p4_dur
+                         << " cycles  [cycle " << _cp_phase2_end_cycle
+                         << " ~ " << _cp_phase4_end_cycle
+                         << "]  (pipelined with Phase 3)\n"
+                         << "  ---- End-to-End ----\n"
+                         << "  Reduce    (Phase 1+2)   : " << reduce_lat
+                         << " cycles  [outer->cross->center]\n"
+                         << "  Broadcast (Phase 3+4)   : " << broadcast_lat
+                         << " cycles  [center->cross->outer]\n"
+                         << "  Total All-Reduce        : " << total_lat
                          << " cycles\n"
                          << "  ---- Traffic ----\n"
-                         << "  Total flits injected : " << _cp_total_flits
+                         << "  Total flits injected    : " << _cp_total_flits
                          << " flits\n"
                          << "==================================================\n"
                          << endl;
@@ -1117,8 +1179,21 @@ void TrafficManager::_CpInjectPacket( int src, int dest, int size, int cl, bool 
         else if ( dc > half ) slot = 2;
         else                  slot = 3;
     } else if ( gMeshNet->IsCrossNode(src) ) {
-        // Cross nodes (non-center) always use slot 0 (single NI slot)
-        slot = 0;
+        // Cross nodes (non-center): 2 NI slots (directional).
+        // Phase 2 (→ center)  : slot 0.
+        // Phase 4 col-cross   : slot 0 = west (dest_col < half), slot 1 = east
+        // Phase 4 row-cross   : slot 0 = north (dest_row < half), slot 1 = south
+        if ( dest == _cp_center ) {
+            slot = 0;
+        } else {
+            const int half    = _cp_k / 2;
+            const int src_col = src % _cp_k;
+            if ( src_col == half ) {
+                slot = ( dest % _cp_k < half ) ? 0 : 1;   // col-cross: W=0, E=1
+            } else {
+                slot = ( dest / _cp_k < half ) ? 0 : 1;   // row-cross: N=0, S=1
+            }
+        }
     } else {
         // Outer nodes: Px → slot 0 (XY), Py → slot 1 (YX)
         slot = is_px ? 0 : 1;
@@ -1151,6 +1226,17 @@ void TrafficManager::_CpInjectPacket( int src, int dest, int size, int cl, bool 
 
     _requestsOutstanding[src]++;
     _cp_total_flits += size;
+
+    if ( _cp_trace ) {
+        const char *phase_tag =
+            (src != _cp_center && !gMeshNet->IsCrossNode(src)) ? "Phase1" :
+            (gMeshNet->IsCrossNode(src) && dest == _cp_center) ? "Phase2" :
+            (src == _cp_center)                                 ? "Phase3" : "Phase4";
+        cout << "[CP TRACE][Cycle " << _time << "] INJECT "
+             << phase_tag << "  N" << src << " -> N" << dest
+             << (is_px ? "  Px" : "  Py")
+             << "  " << size << " flits" << endl;
+    }
 }
 
 // ============================================================
@@ -1209,14 +1295,21 @@ void TrafficManager::_InjectCrossToCenter( int cross_node )
 void TrafficManager::_InjectCenterToCross()
 {
     assert(gMeshNet != nullptr);
-    const Mesh *mesh    = static_cast<const Mesh *>(gMeshNet);
-    const int   cl      = 0;
-    const int   size    = _GetNextPacketSize(cl) / 2;   // D/2 per cross node
+    const Mesh *mesh = static_cast<const Mesh *>(gMeshNet);
+    const int   cl   = 0;
+    const int   size = _GetNextPacketSize(cl) / 2;   // D/2 per cross node
+    const int   half = _cp_k / 2;
 
-    for ( int node = 0; node < _nodes; ++node ) {
-        if ( !mesh->IsCrossNode(node) || mesh->IsCenterNode(node) ) continue;
-
-        _CpInjectPacket(_cp_center, node, size, cl, /*is_px=*/true);
+    // Far-first: 2-hop cross nodes (N2/N10/N14/N22) before 1-hop (N7/N11/N13/N17).
+    // Each center slot (N/S/E/W) queues the far node first so it departs before
+    // the near node, avoiding link contention at the intermediate near-cross router.
+    for ( int pass = 2; pass >= 1; --pass ) {
+        for ( int node = 0; node < _nodes; ++node ) {
+            if ( !mesh->IsCrossNode(node) || mesh->IsCenterNode(node) ) continue;
+            const int dist = abs(node / _cp_k - half) + abs(node % _cp_k - half);
+            if ( dist != pass ) continue;
+            _CpInjectPacket(_cp_center, node, size, cl, /*is_px=*/true);
+        }
     }
 }
 
@@ -1233,11 +1326,14 @@ void TrafficManager::_InjectColCrossToOuter( int col_cross_node )
     const int row  = col_cross_node / _cp_k;
     const int half = _cp_k / 2;
 
-    for ( int col = 0; col < _cp_k; ++col ) {
-        if ( col == half ) continue;   // skip center column
-        const int outer = row * _cp_k + col;
-        _CpInjectPacket(col_cross_node, outer, size, cl, /*is_px=*/true);
-    }
+    // Far-first within each slot:
+    // Slot 0 (west): col 0 (2-hop) → col half-1 (1-hop)  — ascending
+    for ( int col = 0; col < half; ++col )
+        _CpInjectPacket(col_cross_node, row * _cp_k + col, size, cl, /*is_px=*/true);
+
+    // Slot 1 (east): col k-1 (2-hop) → col half+1 (1-hop) — descending
+    for ( int col = _cp_k - 1; col > half; --col )
+        _CpInjectPacket(col_cross_node, row * _cp_k + col, size, cl, /*is_px=*/true);
 }
 
 // ============================================================
@@ -1253,11 +1349,14 @@ void TrafficManager::_InjectRowCrossToOuter( int row_cross_node )
     const int col  = row_cross_node % _cp_k;
     const int half = _cp_k / 2;
 
-    for ( int row = 0; row < _cp_k; ++row ) {
-        if ( row == half ) continue;   // skip center row
-        const int outer = row * _cp_k + col;
-        _CpInjectPacket(row_cross_node, outer, size, cl, /*is_px=*/false);
-    }
+    // Far-first within each slot:
+    // Slot 0 (north): row 0 (2-hop) → row half-1 (1-hop) — ascending
+    for ( int row = 0; row < half; ++row )
+        _CpInjectPacket(row_cross_node, row * _cp_k + col, size, cl, /*is_px=*/false);
+
+    // Slot 1 (south): row k-1 (2-hop) → row half+1 (1-hop) — descending
+    for ( int row = _cp_k - 1; row > half; --row )
+        _CpInjectPacket(row_cross_node, row * _cp_k + col, size, cl, /*is_px=*/false);
 }
 
 // ============================================================
@@ -1316,10 +1415,15 @@ void TrafficManager::_Step( )
         cout << "WARNING: Possible network deadlock.\n";
     }
 
-    vector<map<int, Flit *> > flits(_subnets);
-  
+    // flits[subnet][node] holds all ejected flits for that node this cycle.
+    // Center node can eject up to 4 flits/cycle (one per directional slot).
+    // flits[subnet][node] stores (flit, ejection_slot) pairs so the
+    // retirement loop can write credits to the correct slot credit channel.
+    vector<map<int, vector<pair<Flit *, int>>>> flits(_subnets);
+
     for ( int subnet = 0; subnet < _subnets; ++subnet ) {
         for ( int n = 0; n < _nodes; ++n ) {
+            // Read ejection slot 0 via standard Network::ReadFlit.
             Flit * const f = _net[subnet]->ReadFlit( n );
             if ( f ) {
                 if(f->watch) {
@@ -1330,11 +1434,37 @@ void TrafficManager::_Step( )
                                << " from VC " << f->vc
                                << "." << endl;
                 }
-                flits[subnet].insert(make_pair(n, f));
+                flits[subnet][n].push_back({f, 0});
                 if((_sim_state == warming_up) || (_sim_state == running)) {
                     ++_accepted_flits[f->cl][n];
                     if(f->tail) {
                         ++_accepted_packets[f->cl][n];
+                    }
+                }
+            }
+
+            // Read extra ejection slots (center node has 4 total).
+            {
+                const Mesh *emesh = dynamic_cast<const Mesh *>(_net[subnet]);
+                int ne = emesh ? emesh->NumEjectionSlots(n) : 1;
+                for ( int eslot = 1; eslot < ne; ++eslot ) {
+                    Flit * const ef = emesh->ReadFlitFromEjectSlot(n, eslot);
+                    if ( ef ) {
+                        if(ef->watch) {
+                            *gWatchOut << GetSimTime() << " | "
+                                       << "node" << n << " | "
+                                       << "Ejecting flit " << ef->id
+                                       << " (packet " << ef->pid << ")"
+                                       << " from VC " << ef->vc
+                                       << " slot " << eslot << "." << endl;
+                        }
+                        flits[subnet][n].push_back({ef, eslot});
+                        if((_sim_state == warming_up) || (_sim_state == running)) {
+                            ++_accepted_flits[ef->cl][n];
+                            if(ef->tail) {
+                                ++_accepted_packets[ef->cl][n];
+                            }
+                        }
                     }
                 }
             }
@@ -1607,27 +1737,34 @@ void TrafficManager::_Step( )
 
     for(int subnet = 0; subnet < _subnets; ++subnet) {
         for(int n = 0; n < _nodes; ++n) {
-            map<int, Flit *>::const_iterator iter = flits[subnet].find(n);
+            auto iter = flits[subnet].find(n);
             if(iter != flits[subnet].end()) {
-                Flit * const f = iter->second;
+                Mesh *emesh = dynamic_cast<Mesh *>(_net[subnet]);
+                for ( auto & fp : iter->second ) {
+                    Flit * f    = fp.first;
+                    int    eslot = fp.second;
+                    f->atime = _time;
+                    if(f->watch) {
+                        *gWatchOut << GetSimTime() << " | "
+                                   << "node" << n << " | "
+                                   << "Injecting credit for VC " << f->vc
+                                   << " into subnet " << subnet
+                                   << "." << endl;
+                    }
+                    Credit * const c = Credit::New();
+                    c->vc.insert(f->vc);
+                    if (emesh) {
+                        emesh->WriteEjectCredit(c, n, eslot);
+                    } else {
+                        _net[subnet]->WriteCredit(c, n);
+                    }
 
-                f->atime = _time;
-                if(f->watch) {
-                    *gWatchOut << GetSimTime() << " | "
-                               << "node" << n << " | "
-                               << "Injecting credit for VC " << f->vc 
-                               << " into subnet " << subnet 
-                               << "." << endl;
-                }
-                Credit * const c = Credit::New();
-                c->vc.insert(f->vc);
-                _net[subnet]->WriteCredit(c, n);
-	
 #ifdef TRACK_FLOWS
-                ++_ejected_flits[f->cl][n];
+                    ++_ejected_flits[f->cl][n];
 #endif
-	
-                _RetireFlit(f, n);
+
+                    _RetireFlit(f, n);
+                }
             }
         }
         flits[subnet].clear();

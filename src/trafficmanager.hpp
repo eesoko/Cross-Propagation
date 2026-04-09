@@ -318,12 +318,21 @@ protected:
   int  _cp_outer_recv;
 
   // --- Timing ---
-  int  _cp_phase1_start_cycle;   // cycle when Phase 0 injection fired
-  int  _cp_phase1_end_cycle;     // cycle when center global barrier fired
-  int  _cp_phase2_end_cycle;     // cycle when last outer node received Phase 1.5 packet
+  int  _cp_phase1_start_cycle;       // cycle when Phase 1 injection fired (outer→cross)
+  int  _cp_phase1_local_end_cycle;   // cycle when last Phase 1 local barrier fired
+  int  _cp_phase2_end_cycle;         // cycle when Phase 2 global barrier fired (center recv 8)
+  int  _cp_phase3_end_cycle;         // cycle when last cross node received from center
+  int  _cp_phase4_end_cycle;         // cycle when last outer node received (all-reduce done)
+
+  // --- Counters for per-phase tracking ---
+  int  _cp_cross_all_sent_count;     // how many cross nodes have injected to center (0-8)
+  int  _cp_cross_p2_recv_count;      // how many cross nodes have received from center (0-8)
 
   // --- Traffic volume ---
   int  _cp_total_flits;          // total flits injected across all CP phases
+
+  // --- Verbose trace ---
+  bool _cp_trace;                // per-packet event logging (config: cp_trace = 1)
 
   // --- Node classification helpers ---
   // Returns true if node is a col-cross node (on center col, not center row).
